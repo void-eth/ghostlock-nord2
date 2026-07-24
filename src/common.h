@@ -4,6 +4,16 @@
 #define _GNU_SOURCE
 #define __ARM 1
 
+/* CRITICAL: Define these BEFORE including kernelsnitch headers
+ * to override the default calculation which limits to 64GB
+ */
+#ifndef KERNELSNITCH_IDENTITY_START
+#define KERNELSNITCH_IDENTITY_START 0xffffff8000000000ULL
+#endif
+#ifndef KERNELSNITCH_IDENTITY_END
+#define KERNELSNITCH_IDENTITY_END 0xffffffc000000000ULL
+#endif
+
 #include "offset.h"
 
 #include <dirent.h>
@@ -50,8 +60,7 @@
 
 #define DIRECT_MAP_BASE P0_PAGE_OFFSET
 #define DIRECT_MAP_END 0xffffffc000000000ULL
-#define KERNELSNITCH_IDENTITY_START DIRECT_MAP_BASE
-#define KERNELSNITCH_IDENTITY_END DIRECT_MAP_END
+/* KERNELSNITCH_IDENTITY_START/END already defined above before kernelsnitch includes */
 
 #define LOCK_OFF 0x1350
 #define W0_OFF 0x2220
