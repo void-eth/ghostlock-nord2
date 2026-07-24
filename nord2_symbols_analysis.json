@@ -1,0 +1,66 @@
+{
+  "found": {
+    "_stext": {
+      "addr": "0xffffff9805280800",
+      "type": "T"
+    },
+    "_etext": {
+      "addr": "0xffffff9806380000",
+      "type": "T"
+    },
+    "commit_creds": {
+      "addr": "0xffffff98052e1704",
+      "type": "T"
+    },
+    "prepare_kernel_cred": {
+      "addr": "0xffffff98052e1a9c",
+      "type": "T"
+    },
+    "noop_llseek": {
+      "addr": "0xffffff980547d940",
+      "type": "T"
+    },
+    "cap_capable": {
+      "addr": "0xffffff980564be2c",
+      "type": "T"
+    },
+    "nfulnl_log_packet": {
+      "addr": "0xffffff98061712b4",
+      "type": "T"
+    },
+    "ashmem_ioctl": {
+      "addr": "0xffffff9806005e3c",
+      "type": "t"
+    },
+    "ashmem_llseek": {
+      "addr": "0xffffff9806005ce8",
+      "type": "t"
+    },
+    "ashmem_mmap": {
+      "addr": "0xffffff9806006764",
+      "type": "t"
+    },
+    "ashmem_open": {
+      "addr": "0xffffff98060068cc",
+      "type": "t"
+    },
+    "remove_waiter": {
+      "addr": "0xffffff9805336534",
+      "type": "t"
+    },
+    "rt_mutex_start_proxy_lock": {
+      "addr": "0xffffff98053364a4",
+      "type": "T"
+    }
+  },
+  "not_found": [
+    "_text",
+    "init_task",
+    "init_cred",
+    "selinux_state",
+    "selinux_enforcing",
+    "memstart_addr",
+    "kimage_voffset"
+  ],
+  "kernel_base": "0xffffff9805280800"
+}
