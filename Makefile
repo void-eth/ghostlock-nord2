@@ -24,7 +24,7 @@ LDFLAGS += -Wl,--hash-style=gnu
 
 # Source files
 SRCS = src/main.c src/slide.c src/util.c src/fops.c src/pipe.c \
-       src/preload.c src/su_daemon.c
+       src/preload.c src/su_daemon.c src/su_stub.c
 
 # Object files
 OBJS = $(SRCS:.c=.o)
