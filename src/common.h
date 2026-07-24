@@ -56,7 +56,7 @@
 #define MM_ORDER 3           /* TODO: 5.10 mm_cachep の slab order を要確認（grooming, Gap D） */
 #define MM_PARTIALS 5
 #define CORE 0
-#define KSNITCH_COLLISIONS 4
+#define KSNITCH_COLLISIONS 8  /* Increased for MediaTek 4.14 */
 
 #define DIRECT_MAP_BASE P0_PAGE_OFFSET
 #define DIRECT_MAP_END 0xffffffc000000000ULL

