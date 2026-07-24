@@ -16,7 +16,7 @@
 /* MediaTek 4.14 memory map */
 #define P0_PAGE_OFFSET 0xffffff8000000000ULL
 #define P0_PHYS_OFFSET 0x40000000ULL
-#define P0_KERNEL_PHYS_LOAD 0x40080000ULL
+#define P0_KERNEL_PHYS_LOAD 0x40000000ULL  /* Same as P0_PHYS_OFFSET, delta=0 */
 
 /* Actual kernel base from kallsyms - this is critical for direct KASLR */
 #define ACTUAL_KERNEL_BASE 0xffffff9805280800ULL
@@ -62,7 +62,7 @@
 #define INIT_TASK_OFF 0x01000000ULL
 #define INIT_CRED_OFF 0x01016000ULL
 #define SELINUX_ENFORCING_OFF 0x01400000ULL
-#define PER_CPU_OFFSET_OFF 0x01200000ULL
+#define PER_CPU_OFFSET_OFF 0x01200038ULL  /* Fixed: actual offset from kallsyms */
 #define ENTRY_TASK_OFF 0x01100000ULL
 #define ROOT_TASK_GROUP_OFF 0x01300000ULL
 
