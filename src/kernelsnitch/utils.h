@@ -23,12 +23,6 @@
 #include <android/log.h>
 #endif
 
-/* Persistent, crash-surviving file sink for pr_* output. Defined once in
-   util.c; the ANDROID_APP_NO_LKM pr_* macros below tee every line into it so
-   logs survive an app crash / kernel oops and the forked child (whose logd fd
-   is clobbered by the pselect fd install). flush!=0 also fsyncs. */
-void poc_flog(int flush, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-
 #ifndef HIDEMINMAX
 #define MAX(X,Y) (((X) > (Y)) ? (X) : (Y))
 #define MIN(X,Y) (((X) < (Y)) ? (X) : (Y))
@@ -74,20 +68,16 @@ void poc_flog(int flush, const char *fmt, ...) __attribute__((format(printf, 2, 
 #ifdef ANDROID_APP_NO_LKM
 #define pr_error(fmt, ...) do { \
         __android_log_print(ANDROID_LOG_ERROR, "google_poc_app", "[!] %s:%d " fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
-        poc_flog(1, "[!] %s:%d " fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
         exit(-1); \
     } while (0)
 #define pr_warning(fmt, ...) do { \
         __android_log_print(ANDROID_LOG_WARN, "google_poc_app", "[-] %s:%d " fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
-        poc_flog(1, "[-] %s:%d " fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
     } while (0)
 #define pr_info(fmt, ...) do { \
         __android_log_print(ANDROID_LOG_INFO, "google_poc_app", "[*] %s:%d " fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
-        poc_flog(0, "[*] %s:%d " fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
     } while (0)
 #define pr_success(fmt, ...) do { \
         __android_log_print(ANDROID_LOG_INFO, "google_poc_app", "[+] %s:%d " fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
-        poc_flog(1, "[+] %s:%d " fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
     } while (0)
 #else
 #define pr_error(fmt, ...) do { \
@@ -108,20 +98,16 @@ void poc_flog(int flush, const char *fmt, ...) __attribute__((format(printf, 2, 
 #ifdef ANDROID_APP_NO_LKM
 #define pr_error(fmt, ...) do { \
         __android_log_print(ANDROID_LOG_ERROR, "google_poc_app", "[!] " fmt, ##__VA_ARGS__); \
-        poc_flog(1, "[!] " fmt, ##__VA_ARGS__); \
         exit(-1); \
     } while (0)
 #define pr_warning(fmt, ...) do { \
         __android_log_print(ANDROID_LOG_WARN, "google_poc_app", "[-] " fmt, ##__VA_ARGS__); \
-        poc_flog(1, "[-] " fmt, ##__VA_ARGS__); \
     } while (0)
 #define pr_info(fmt, ...) do { \
         __android_log_print(ANDROID_LOG_INFO, "google_poc_app", "[*] " fmt, ##__VA_ARGS__); \
-        poc_flog(0, "[*] " fmt, ##__VA_ARGS__); \
     } while (0)
 #define pr_success(fmt, ...) do { \
         __android_log_print(ANDROID_LOG_INFO, "google_poc_app", "[+] " fmt, ##__VA_ARGS__); \
-        poc_flog(1, "[+] " fmt, ##__VA_ARGS__); \
     } while (0)
 #else
 #define pr_error(fmt, ...) do { \

