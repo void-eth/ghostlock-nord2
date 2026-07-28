@@ -14,6 +14,7 @@ TARGET = $(ARCH)-linux-android$(API)
 CFLAGS = -O2 -Wall -Wno-unused-parameter -Wno-sign-compare -Wno-unused-function
 CFLAGS += -fPIE -fstack-protector-strong
 CFLAGS += -Isrc -Isrc/kernelsnitch
+CFLAGS += -D__ARM=1  # Define ARM architecture before kernelsnitch includes
 CFLAGS += -D_GNU_SOURCE
 CFLAGS += -DUSE_DIRECT_KASLR  # Use direct KASLR from kallsyms
 
@@ -60,3 +61,6 @@ test: $(OUTPUT)
 	@echo "Testing build..."
 	file $(OUTPUT)
 	readelf -h $(OUTPUT) | grep -E "Type|Machine"
+
+# Use correct kernel offsets - bypass kernelsnitch timing attack
+CFLAGS += -DBYPASS_KERNELSNITCH

